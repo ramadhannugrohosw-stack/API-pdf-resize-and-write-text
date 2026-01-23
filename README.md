@@ -81,6 +81,20 @@ curl.exe -sS -X POST "http://localhost:3000/resize-stamp" ^
  
   -o "D:\Documents\contoh pdf\out.pdf"
 
+If want custom position text, edit dxCm and dyCm:
+-
+curl.exe -sS -X POST "http://localhost:3000/resize-stamp" ^
+
+  -F "file=@\"D:\Documents\contoh pdf\NKNK.pdf\";type=application/pdf" ^
+ 
+  -F "text=TEST" ^
+
+  -F "dxCm=-1.5" ^
+  
+  -F "dyCm=0.5" ^
+  
+  -o "D:\Documents\contoh pdf\out.pdf"
+
 
 
 --------------------------------
@@ -114,5 +128,21 @@ curl -X POST "http://localhost:3000/resize-stamp" \
   -F "text=Hello World" \
   
   -o /home/user/output.pdf
+
+If want custom position text, edit dxCm and dyCm:
+-
+
+curl -X POST "http://localhost:3000/resize-stamp" \
+
+  -F "file=@/home/user/input.pdf" \
+  
+  -F "text=Hello World" \
+  
+  -F "dxCm=-1.5" \
+  
+  -F "dyCm=0.5" \
+  
+  -o /home/user/output.pdf
+
 
 
