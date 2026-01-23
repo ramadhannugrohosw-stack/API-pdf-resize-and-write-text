@@ -35,7 +35,7 @@ const DEFAULT_ADD_WIDTH_CM = Number(process.env.DEFAULT_ADD_WIDTH_CM || 5);
 const DEFAULT_SIDE = (process.env.DEFAULT_SIDE || "right").toLowerCase(); // right|left|both
 const DEFAULT_APPLY_TO = process.env.DEFAULT_APPLY_TO || "Both"; // MediaBox|CropBox|Both
 const DEFAULT_X_CM = Number(process.env.DEFAULT_X_CM || -1); // negative -> condong ke halaman asli
-const DEFAULT_Y_CM = Number(process.env.DEFAULT_Y_CM || 1);
+const DEFAULT_Y_CM = Number(process.env.DEFAULT_Y_CM || 14);
 const DEFAULT_FONT_SIZE = Number(process.env.DEFAULT_FONT_SIZE || 12);
 const DEFAULT_FONT = process.env.DEFAULT_FONT || "Helvetica";
 
@@ -179,7 +179,12 @@ app.post(
     const outputPath = path.join(TMP_DIR, `${Date.now()}_${id}_output.pdf`);
 
     // NOTE: text/dxCm/dyCm datang dari req.body (bukan file)
-    const text = (req.body?.text || "").trim();
+    // text bisa string atau array jika field "text" dikirim berulang kali
+    const textRaw = req.body?.text;
+    const textList = Array.isArray(textRaw)
+      ? textRaw.map((t) => String(t || "").trim()).filter(Boolean)
+      : [String(textRaw || "").trim()].filter(Boolean);
+
     const dxCm = safeNumber(req.body?.dxCm, DEFAULT_X_CM);
     const dyCm = safeNumber(req.body?.dyCm, 0);
 
@@ -201,19 +206,32 @@ app.post(
           addWidthCm: DEFAULT_ADD_WIDTH_CM,
           side: DEFAULT_SIDE,
           applyTo: DEFAULT_APPLY_TO,
-          texts: text
-            ? [
-                {
-                  value: text,
-                  position: "right_top", // <-- AKTIFKAN MODE ABSOLUT
-                  marginTopCm: 5, // <-- 5 cm dari atas
-                  dxCm: dxCm, // negatif = condong ke halaman asli
-                  dyCm: dyCm, // offset kecil (opsional) // dyCm sebagai offset dari default
+          texts: textList.length
+            ? // Jika user kirim banyak text => page 1,2,3,...
+              // Jika hanya 1 text => backward compatible: tetap "all"
+              textList.length > 1
+              ? textList.map((t, idx) => ({
+                  value: t,
+                  position: "right_top",
+                  marginTopCm: 5,
+                  dxCm: dxCm,
+                  dyCm: dyCm,
                   fontSize: DEFAULT_FONT_SIZE,
                   font: DEFAULT_FONT,
-                  page: "all",
-                },
-              ]
+                  page: idx + 1, // 1-based page number
+                }))
+              : [
+                  {
+                    value: textList[0],
+                    position: "right_top",
+                    marginTopCm: 5,
+                    dxCm: dxCm,
+                    dyCm: dyCm,
+                    fontSize: DEFAULT_FONT_SIZE,
+                    font: DEFAULT_FONT,
+                    page: "all", // tetap seperti sebelumnya
+                  },
+                ]
             : [],
         };
       }
