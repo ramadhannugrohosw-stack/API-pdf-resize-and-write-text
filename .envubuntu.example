@@ -1,0 +1,17 @@
+# ============================
+# PDF Resize & Stamp API
+# Environment (Linux / Ubuntu)
+# ============================
+
+# Port server Express
+PORT=3000
+
+# Temporary directory for uploaded & output PDFs
+TMP_DIR=./temp
+
+# Python executable
+# Di Linux hampir selalu python3
+PYTHON_BIN=python3
+
+# Max upload file size (MB)
+MAX_FILE_MB=50

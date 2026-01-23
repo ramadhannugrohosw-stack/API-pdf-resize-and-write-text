@@ -1,0 +1,18 @@
+# ============================
+# PDF Resize & Stamp API
+# Environment (Windows)
+# ============================
+
+# Port server Express
+PORT=3000
+
+# Temporary directory for uploaded & output PDFs
+# Gunakan path relatif atau absolut Windows
+TMP_DIR=./temp
+
+# Python executable
+# Jika Python ter-install dan sudah masuk PATH, biarkan "python"
+PYTHON_BIN=python
+
+# Max upload file size (MB)
+MAX_FILE_MB=50

@@ -1,0 +1,25 @@
+{
+  "addWidthCm": 5,
+  "side": "right",
+  "applyTo": "Both",
+  "texts": [
+    {
+      "value": "AREA KOSONG KANAN",
+      "xCm": 1.0,
+      "yCm": 25.0,
+      "fontSize": 14,
+      "font": "Helvetica",
+      "page": "all",
+      "anchor": "blank_right"
+    },
+    {
+      "value": "Catatan halaman 1",
+      "xCm": 1.0,
+      "yCm": 2.0,
+      "fontSize": 10,
+      "font": "Helvetica",
+      "page": 1,
+      "anchor": "page"
+    }
+  ]
+}
