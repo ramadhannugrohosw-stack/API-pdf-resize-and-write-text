@@ -4,12 +4,15 @@
 =======
 # API PDF Resize & Write Text
 
-API berbasis **Node.js + Python** untuk:
+API based on Node.js + Python for:
 
-- Memperlebar halaman PDF (kertas melebar, konten asli tetap)
-- Menambahkan teks (stamp / annotation) ke PDF
-- Mendukung **multi-page PDF**
-- Bisa input **teks sederhana** atau **JSON options lanjutan**
+Expanding PDF page canvas (paper becomes wider, original content stays unchanged)
+
+Adding text (stamp / annotation) onto the PDF
+
+Supporting multi-page PDFs
+
+Accepting simple text input or advanced JSON options
 
 Engine PDF:
 
@@ -166,6 +169,8 @@ curl -X POST "http://localhost:3000/resize-stamp" \
 -o /home/user/output.pdf
 
 ## or
+curl -X POST "http://localhost:3000/resize-stamp" -F "file=@/home/user/input.pdf" -F "text=Hello World" -F "dxCm=-1.5" -F "dyCm=-3"-o /home/user/output.pdf
 
+## If more than 1 page
 curl -X POST "http://localhost:3000/resize-stamp" -F "file=@/home/user/input.pdf" -F "text=Hello World" -F "text=Hello World2" -F "dxCm=-1.5" -F "dyCm=-3"-o /home/user/output.pdf
->>>>>>> 09ac16e (feat: support multiple text inputs mapped per page in simple mode)
+
