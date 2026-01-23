@@ -17,11 +17,11 @@ Compatible:
 
 
 
----
 -------------------------
 How to call API - Windows
+-
 -------------------------
----
+
 
 copy envwindows.example to .env
 
@@ -61,11 +61,12 @@ curl.exe -sS -X POST "http://localhost:3000/resize-stamp" ^
   -o "D:\Documents\contoh pdf\out.pdf"
 
 
----
+
 --------------------------------
 How to call API - Ubuntu / Linux
+-
 --------------------------------
----
+
 
 term
 -
@@ -92,3 +93,4 @@ curl -X POST "http://localhost:3000/resize-stamp" \
   -F "text=Hello World" \
   
   -o /home/user/output.pdf
+
