@@ -23,7 +23,7 @@ from pikepdf import Name
 
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.colors import black
-
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 PT_PER_INCH = 72.0
 CM_PER_INCH = 2.54
@@ -65,7 +65,9 @@ def parse_page_selector(page_value: Any, page_count: int) -> List[int]:
       - int (1-based)
       - list of ints (1-based)
     """
-    if page_value is None or (isinstance(page_value, str) and page_value.strip().lower() == "all"):
+    if page_value is None or (
+        isinstance(page_value, str) and page_value.strip().lower() == "all"
+    ):
         return list(range(page_count))
 
     if isinstance(page_value, (int, float)) and not isinstance(page_value, bool):
@@ -96,7 +98,9 @@ def parse_page_selector(page_value: Any, page_count: int) -> List[int]:
     return []
 
 
-def get_box(page: pikepdf.Page, box_name: str) -> Optional[Tuple[float, float, float, float]]:
+def get_box(
+    page: pikepdf.Page, box_name: str
+) -> Optional[Tuple[float, float, float, float]]:
     """
     box_name: "MediaBox" / "CropBox"
     Returns (x0, y0, x1, y1) in pts, or None if absent.
@@ -118,7 +122,7 @@ def set_box(page: pikepdf.Page, box_name: str, box: Tuple[float, float, float, f
 def resize_box(
     box: Tuple[float, float, float, float],
     add_width_pt: float,
-    side: str
+    side: str,
 ) -> Tuple[float, float, float, float]:
     x0, y0, x1, y1 = box
     if add_width_pt <= 0:
@@ -141,7 +145,7 @@ def ensure_cropbox_consistent(page: pikepdf.Page, new_media: Tuple[float, float,
         set_box(page, "CropBox", new_media)
 
 
-def clamp_font_size(v: Any, default: float = 12.0) -> float:
+def clamp_font_size(v: Any, default: float = 8.5) -> float:
     fs = safe_float(v, default)
     if fs <= 0:
         return default
@@ -154,6 +158,19 @@ def normalize_font_name(v: Any) -> str:
     s = str(v) if v is not None else "Helvetica"
     s = s.strip()
     return s or "Helvetica"
+
+
+def normalize_align(v: Any) -> str:
+    """
+    left | center | right
+    """
+    s = str(v) if v is not None else "right"
+    s = s.strip().lower()
+    if s in ("right", "r"):
+        return "right"
+    if s in ("center", "centre", "c", "middle"):
+        return "center"
+    return "left"
 
 
 def build_overlay_pdf_for_page(
@@ -180,9 +197,17 @@ def build_overlay_pdf_for_page(
             if not value:
                 continue
 
+            # NOTE: anchor currently forced to "page" below (kept for compatibility)
             anchor = str(item.get("anchor", "blank_right")).strip().lower()
+
             font_name = normalize_font_name(item.get("font", "Helvetica"))
-            font_size = clamp_font_size(item.get("fontSize", 12))
+            font_size = clamp_font_size(item.get("fontSize", 8.5))
+
+            # ✅ charSpace only works with TextObject (beginText)
+            # Use pt units. Default 0.0 keeps current behavior.
+            char_space = safe_float(item.get("charSpace"), 0.52)
+
+            align = normalize_align(item.get("align", "right"))
 
             # Coordinates: prefer pt if provided, else cm
             position = str(item.get("position", "")).strip().lower()
@@ -192,7 +217,7 @@ def build_overlay_pdf_for_page(
             dy_cm = safe_float(item.get("dyCm"), 0.0)
 
             # default margins
-            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)   # 5 cm dari atas
+            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)    # 5 cm dari atas
             margin_right_cm = safe_float(item.get("marginRightCm"), 1.0)
 
             # If explicit coords provided, keep compatibility
@@ -204,31 +229,60 @@ def build_overlay_pdf_for_page(
                 y = cm_to_pt(safe_float(item.get("yCm"), 0.0))
             else:
                 # Position-based mode (absolute + automatic)
-                if position in ("right_top", "top_right"):
-                    # y: 5 cm from top
-                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
-
-                    # x: area kanan (blank + sedikit masuk)
-                    x = (old_width_pt) - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
-
+                if position in ("left_top", "top_left"):
                     anchor = "page"
-                else:
                     # fallback
                     x = cm_to_pt(dx_cm)
                     y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
                     anchor = "page"
+                elif position in ("right_top", "top_right"):
+                    # y: 5 cm from top (+ dy offset)
+                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
+
+                    # x: near the right edge of the ORIGINAL page width (+ dx offset)
+                    # For right-aligned numeric columns: x is the right boundary.
+                    x = (old_width_pt) - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
+
+                else:
+                    # y: 5 cm from top (+ dy offset)
+                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
+
+                    # x: near the right edge of the ORIGINAL page width (+ dx offset)
+                    # For right-aligned numeric columns: x is the right boundary.
+                    x = (old_width_pt) - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
+
 
             # - "page": coords from full page origin (0,0)
             # - "blank_right": coords from the start of the new blank area (right side)
+            # Current behavior: forced to page origin for stability
             anchor = "page"
 
             lines = value.split("\n")
-            leading = safe_float(item.get("leading"), font_size * 1.2)
+            leading = safe_float(item.get("leading"), font_size * 1)
 
-            c.setFont(font_name, font_size)
             cur_y = y
             for line in lines:
-                c.drawString(x, cur_y, line)
+                # --- compute width including char spacing ---
+                base_w = stringWidth(line, font_name, font_size)
+                extra_w = max(len(line) - 1, 0) * char_space
+                total_w = base_w + extra_w
+
+                # --- create text object to apply char spacing ---
+                t = c.beginText()
+                t.setFont(font_name, font_size)
+                t.setCharSpace(char_space)
+
+                if align == "right":
+                    # x is right boundary
+                    t.setTextOrigin(x - total_w, cur_y)
+                elif align == "center":
+                    t.setTextOrigin(x - (total_w / 2.0), cur_y)
+                else:
+                    t.setTextOrigin(x, cur_y)
+
+                t.textLine(line)
+                c.drawText(t)
+
                 cur_y -= leading
 
         c.showPage()
@@ -276,7 +330,7 @@ def main() -> int:
         with pikepdf.open(in_path) as pdf:
             page_count = len(pdf.pages)
 
-            # Capture old MediaBox per page for "blank_right" anchor offset
+            # Capture old MediaBox per page for positioning logic
             old_media_boxes: List[Tuple[float, float, float, float]] = []
             for p in pdf.pages:
                 mb = get_box(p, "MediaBox")
@@ -305,7 +359,10 @@ def main() -> int:
 
             # 2) Stamp text overlays per page (if any)
             if texts:
-                items_by_page: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(page_count)}
+                items_by_page: Dict[int, List[Dict[str, Any]]] = {
+                    i: [] for i in range(page_count)
+                }
+
                 for item in texts:
                     if not isinstance(item, dict):
                         continue
