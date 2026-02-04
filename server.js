@@ -33,13 +33,13 @@ const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
 // Default stamping params when user only sends "text"
 const DEFAULT_ADD_WIDTH_CM = Number(process.env.DEFAULT_ADD_WIDTH_CM || 0);
 const DEFAULT_SIDE = (process.env.DEFAULT_SIDE || "right").toLowerCase(); // right|left|both
-const DEFAULT_APPLY_TO = process.env.DEFAULT_APPLY_TO || "Both"; // MediaBox|CropBox|Both
+const DEFAULT_APPLY_TO = process.env.DEFAULT_APPLY_TO || "both"; // MediaBox|CropBox|Both
 const DEFAULT_X_CM = Number(process.env.DEFAULT_X_CM || 19); // negative -> condong ke halaman asli
 const DEFAULT_Y_CM = Number(process.env.DEFAULT_Y_CM || 14);
 const DEFAULT_FONT_SIZE = Number(process.env.DEFAULT_FONT_SIZE || 8.5);
 const DEFAULT_FONT = process.env.DEFAULT_FONT || "Helvetica";
 const DEFAULT_ALIGN = (process.env.DEFAULT_ALIGN || "right").toLowerCase();
-const DEFAULT_CHAR_SPACE = (process.env.DEFAULT_CHAR_SPACE || 0.5) ;
+const DEFAULT_CHAR_SPACE = process.env.DEFAULT_CHAR_SPACE || 0.5;
 
 // Ensure tmp dir exists
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -214,7 +214,7 @@ app.post(
               textList.length > 1
               ? textList.map((t, idx) => ({
                   value: t,
-                  align: DEFAULT_ALIGN,      // ✅ DEFAULT RIGHT ALIGN
+                  align: DEFAULT_ALIGN, // ✅ DEFAULT RIGHT ALIGN
                   char_space: DEFAULT_CHAR_SPACE,
                   position: "right_top",
                   marginTopCm: 5,
@@ -262,14 +262,38 @@ app.post(
     }
 
     // Normalize / safety defaults
+    // Backward compatibility: simple text
+    if (req.body.text && !req.body.options) {
+      options = {
+        texts: [
+          {
+            value: String(req.body.text),
+            page: "all",
+            dxCm: 0,
+            dyCm: 0,
+          },
+        ],
+      };
+    }
+
     options = {
-      addWidthCm: options.addWidthCm ?? DEFAULT_ADD_WIDTH_CM,
-      side: options.side ?? DEFAULT_SIDE,
-      applyTo: options.applyTo ?? DEFAULT_APPLY_TO,
+      addWidthCm: Number(options.addWidthCm ?? DEFAULT_ADD_WIDTH_CM),
+      side: String(options.side ?? DEFAULT_SIDE).toLowerCase(),
+      applyTo: String(options.applyTo ?? DEFAULT_APPLY_TO).toLowerCase(),
       texts: Array.isArray(options.texts) ? options.texts : [],
     };
 
+    // Guard: nothing to do
+    if (options.texts.length === 0 && options.addWidthCm === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Nothing to do: no resize and no text to stamp",
+      });
+    }
     const pythonBin = resolvePythonBin();
+    console.log("Normalized options:", options);
+    console.log("req.body:", req.body);
+    console.log("options before normalize:", options);
 
     // Pass options as JSON string arg to avoid shell quoting issues
     const args = [
