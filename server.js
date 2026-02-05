@@ -44,10 +44,9 @@ const DEFAULT_CHAR_SPACE = Number(process.env.DEFAULT_CHAR_SPACE || 0.5);
 // Ensure tmp dir exists
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// ---------- NEW: JSON body parser (untuk Base64 input) ----------
-// Base64 PDF bisa besar, jadi set limit lebih longgar.
-// Ini TIDAK mengubah perilaku endpoint multipart (/resize-stamp).
-const JSON_LIMIT_MB = Math.max(100, MAX_FILE_MB * 3); // aman untuk base64 overhead
+// ---------- NEW: JSON body parser (untuk mode Base64) ----------
+// Base64 ukuran besar → naikkan limit
+const JSON_LIMIT_MB = Math.max(100, MAX_FILE_MB * 3);
 app.use(express.json({ limit: `${JSON_LIMIT_MB}mb` }));
 app.use(express.urlencoded({ extended: true, limit: `${JSON_LIMIT_MB}mb` }));
 
@@ -75,57 +74,7 @@ function safeNumber(v, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function normalizeOptions(options) {
-  return {
-    addWidthCm: Number(options.addWidthCm ?? DEFAULT_ADD_WIDTH_CM),
-    side: String(options.side ?? DEFAULT_SIDE).toLowerCase(),
-    applyTo: String(options.applyTo ?? DEFAULT_APPLY_TO).toLowerCase(),
-    texts: Array.isArray(options.texts) ? options.texts : [],
-  };
-}
-
-function buildDefaultOptionsFromText({ textRaw, dxCm, dyCm }) {
-  // text bisa string atau array jika field "text" dikirim berulang kali
-  const textList = Array.isArray(textRaw)
-    ? textRaw.map((t) => String(t || "").trim()).filter(Boolean)
-    : [String(textRaw || "").trim()].filter(Boolean);
-
-  return {
-    addWidthCm: DEFAULT_ADD_WIDTH_CM,
-    side: DEFAULT_SIDE,
-    applyTo: DEFAULT_APPLY_TO,
-    texts: textList.length
-      ? textList.length > 1
-        ? textList.map((t, idx) => ({
-            value: t,
-            align: DEFAULT_ALIGN, // ✅ DEFAULT RIGHT ALIGN
-            charSpace: DEFAULT_CHAR_SPACE,
-            position: "right_top",
-            marginTopCm: 5,
-            dxCm: dxCm,
-            dyCm: dyCm,
-            fontSize: DEFAULT_FONT_SIZE,
-            font: DEFAULT_FONT,
-            page: idx + 1, // 1-based page number
-          }))
-        : [
-            {
-              value: textList[0],
-              position: "right_top",
-              marginTopCm: 5,
-              dxCm: dxCm,
-              dyCm: dyCm,
-              fontSize: DEFAULT_FONT_SIZE,
-              font: DEFAULT_FONT,
-              page: "all", // tetap seperti sebelumnya
-            },
-          ]
-      : [],
-  };
-}
-
 function stripDataUrlPrefix(b64) {
-  // dukung input: "data:application/pdf;base64,AAAA..."
   const s = String(b64 || "").trim();
   const m = s.match(/^data:application\/pdf;base64,(.*)$/i);
   return m ? m[1] : s;
@@ -133,58 +82,57 @@ function stripDataUrlPrefix(b64) {
 
 function looksLikeBase64(s) {
   if (!s || typeof s !== "string") return false;
-  // longgar saja, yang penting bukan kosong dan tidak ada karakter aneh
-  // (kita akan validasi lebih lanjut saat decode)
   return /^[A-Za-z0-9+/=\s]+$/.test(s) && s.replace(/\s/g, "").length > 0;
 }
 
-async function runPythonResizeStamp({ inputPath, outputPath, options }) {
-  const pythonBin = resolvePythonBin();
+// ---------- Multer (upload PDF + optional JSON) ----------
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, TMP_DIR),
+  filename: (req, file, cb) => {
+    const id = randomId();
+    const original = file.originalname || `${file.fieldname}`;
+    const safeBase = original
+      .replace(/[^\w.\-()+\s]/g, "")
+      .trim()
+      .replace(/\s+/g, "_");
+    cb(null, `${Date.now()}_${id}_${safeBase}`);
+  },
+});
 
-  // Pass options as JSON string arg to avoid shell quoting issues
-  const args = [
-    PY_SCRIPT,
-    "--input",
-    inputPath,
-    "--output",
-    outputPath,
-    "--options",
-    JSON.stringify(options),
-  ];
+// IMPORTANT:
+// Jangan pakai pdfOnlyFilter untuk semua field, karena field "options" (JSON) akan ketolak.
+// Kita bedakan berdasarkan fieldname.
+function uploadFilter(req, file, cb) {
+  const name = file.fieldname;
 
-  return await new Promise((resolve) => {
-    const child = spawn(pythonBin, args, {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  if (name === "file") {
+    const isPdfMime = file.mimetype === "application/pdf";
+    const isPdfExt = (file.originalname || "").toLowerCase().endsWith(".pdf");
+    if (isPdfMime || isPdfExt) return cb(null, true);
+    return cb(new Error("Only PDF files are allowed for field 'file'."));
+  }
 
-    let stdout = "";
-    let stderr = "";
+  if (name === "options") {
+    // allow JSON file
+    const isJsonMime =
+      file.mimetype === "application/json" || file.mimetype === "text/json";
+    const isJsonExt = (file.originalname || "").toLowerCase().endsWith(".json");
+    // Multer kadang memberi mimetype "application/octet-stream"; tetap izinkan jika ekstensi .json
+    if (isJsonMime || isJsonExt) return cb(null, true);
+    return cb(new Error("Only JSON files are allowed for field 'options'."));
+  }
 
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-
-    child.on("error", (err) => {
-      resolve({
-        ok: false,
-        code: -1,
-        stdout,
-        stderr,
-        error: String(err?.message || err),
-      });
-    });
-
-    child.on("close", (code) => {
-      resolve({
-        ok: code === 0,
-        code,
-        stdout,
-        stderr,
-      });
-    });
-  });
+  // text/dxCm/dyCm tidak akan masuk ke sini karena itu bukan file
+  return cb(null, true);
 }
 
+const upload = multer({
+  storage,
+  fileFilter: uploadFilter,
+  limits: { fileSize: MAX_FILE_BYTES },
+});
+
+// ---------- Shared: response output (pdf/base64/both) ----------
 async function returnOutput({ req, res, outputPath }) {
   const outMode = String(req.query?.out || "both").toLowerCase(); // pdf | base64 | both
   const stat = await fsp.stat(outputPath);
@@ -256,52 +204,96 @@ async function returnOutput({ req, res, outputPath }) {
   rs.pipe(res);
 }
 
-// ---------- Multer (upload PDF + optional JSON) ----------
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, TMP_DIR),
-  filename: (req, file, cb) => {
-    const id = randomId();
-    const original = file.originalname || `${file.fieldname}`;
-    const safeBase = original
-      .replace(/[^\w.\-()+\s]/g, "")
-      .trim()
-      .replace(/\s+/g, "_");
-    cb(null, `${Date.now()}_${id}_${safeBase}`);
-  },
-});
+// ---------- Shared: run python ----------
+async function runPython({ inputPath, outputPath, options }) {
+  const pythonBin = resolvePythonBin();
 
-// IMPORTANT:
-// Jangan pakai pdfOnlyFilter untuk semua field, karena field "options" (JSON) akan ketolak.
-// Kita bedakan berdasarkan fieldname.
-function uploadFilter(req, file, cb) {
-  const name = file.fieldname;
+  const args = [
+    PY_SCRIPT,
+    "--input",
+    inputPath,
+    "--output",
+    outputPath,
+    "--options",
+    JSON.stringify(options),
+  ];
 
-  if (name === "file") {
-    const isPdfMime = file.mimetype === "application/pdf";
-    const isPdfExt = (file.originalname || "").toLowerCase().endsWith(".pdf");
-    if (isPdfMime || isPdfExt) return cb(null, true);
-    return cb(new Error("Only PDF files are allowed for field 'file'."));
-  }
+  return await new Promise((resolve) => {
+    const child = spawn(pythonBin, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
-  if (name === "options") {
-    // allow JSON file
-    const isJsonMime =
-      file.mimetype === "application/json" || file.mimetype === "text/json";
-    const isJsonExt = (file.originalname || "").toLowerCase().endsWith(".json");
-    // Multer kadang memberi mimetype "application/octet-stream"; tetap izinkan jika ekstensi .json
-    if (isJsonMime || isJsonExt) return cb(null, true);
-    return cb(new Error("Only JSON files are allowed for field 'options'."));
-  }
+    let stdout = "";
+    let stderr = "";
 
-  // text/dxCm/dyCm tidak akan masuk ke sini karena itu bukan file
-  return cb(null, true);
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+
+    child.on("error", (err) => {
+      resolve({
+        ok: false,
+        code: -1,
+        stdout,
+        stderr,
+        error: String(err?.message || err),
+      });
+    });
+
+    child.on("close", (code) => {
+      resolve({ ok: code === 0, code, stdout, stderr });
+    });
+  });
 }
 
-const upload = multer({
-  storage,
-  fileFilter: uploadFilter,
-  limits: { fileSize: MAX_FILE_BYTES },
-});
+// ---------- Shared: build default options from "text" ----------
+function buildDefaultOptionsFromText({ textRaw, dxCm, dyCm }) {
+  const textList = Array.isArray(textRaw)
+    ? textRaw.map((t) => String(t || "").trim()).filter(Boolean)
+    : [String(textRaw || "").trim()].filter(Boolean);
+
+  return {
+    addWidthCm: DEFAULT_ADD_WIDTH_CM,
+    side: DEFAULT_SIDE,
+    applyTo: DEFAULT_APPLY_TO,
+    texts: textList.length
+      ? textList.length > 1
+        ? textList.map((t, idx) => ({
+            value: t,
+            align: DEFAULT_ALIGN,
+            charSpace: DEFAULT_CHAR_SPACE,
+            position: "right_top",
+            marginTopCm: 5,
+            dxCm: dxCm,
+            dyCm: dyCm,
+            fontSize: DEFAULT_FONT_SIZE,
+            font: DEFAULT_FONT,
+            page: idx + 1,
+          }))
+        : [
+            {
+              value: textList[0],
+              position: "right_top",
+              marginTopCm: 5,
+              dxCm: dxCm,
+              dyCm: dyCm,
+              fontSize: DEFAULT_FONT_SIZE,
+              font: DEFAULT_FONT,
+              page: "all",
+            },
+          ]
+      : [],
+  };
+}
+
+function normalizeOptions(options) {
+  return {
+    addWidthCm: Number(options.addWidthCm ?? DEFAULT_ADD_WIDTH_CM),
+    side: String(options.side ?? DEFAULT_SIDE).toLowerCase(),
+    applyTo: String(options.applyTo ?? DEFAULT_APPLY_TO).toLowerCase(),
+    texts: Array.isArray(options.texts) ? options.texts : [],
+  };
+}
 
 // ---------- Routes ----------
 app.get("/", (req, res) => {
@@ -311,10 +303,7 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "GET /health",
       resizeStamp:
-        "POST /resize-stamp (multipart form-data: file + (text|options) + optional dxCm/dyCm)",
-      // NEW:
-      resizeStampBase64:
-        "POST /resize-stamp-base64 (application/json: fileBase64 + (text|options) + optional dxCm/dyCm)",
+        "POST /resize-stamp (multipart/form-data: file=@pdf OR application/json: fileBase64) + (text|options) + optional dxCm/dyCm",
     },
   });
 });
@@ -338,22 +327,172 @@ app.get("/health", (req, res) => {
 });
 
 /**
- * POST /resize-stamp
+ * ✅ GABUNG: POST /resize-stamp
  *
- * multipart/form-data:
- *   - file: PDF (required)
- *   - text: string (optional)  -> DEFAULT MODE (paling simple)
- *   - dxCm: number (optional)  -> override per request
- *   - dyCm: number (optional)  -> override per request
- *
- * Advanced:
+ * Mode A (LAMA): multipart/form-data
+ *   - file: PDF
  *   - options: JSON string (optional)
- *   - options: JSON file upload (optional)  (mis. payload.json)
+ *   - options: JSON file (optional)
+ *   - text/dxCm/dyCm (optional)
  *
- * Priority:
- *   1) options (string) / options (file) jika dikirim
- *   2) kalau tidak ada options, pakai DEFAULT MODE berbasis field "text"
+ * Mode B (BARU): application/json
+ *   {
+ *     "fileBase64": "....",     // required
+ *     "options": {...} | "{}",  // optional
+ *     "text": "...",            // optional (jika options tidak ada)
+ *     "dxCm": 0, "dyCm": 0      // optional
+ *   }
+ *
+ * Output (sama seperti sebelumnya):
+ *   ?out=pdf | base64 | both   (default: both)
  */
+
+// ---- Router 1: deteksi JSON base64, kalau bukan JSON lanjut ke multer handler ----
+app.post("/resize-stamp", async (req, res, next) => {
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+
+  if (ct.includes("application/json")) {
+    // handle base64 JSON mode
+    const id = randomId();
+    const inputPath = path.join(TMP_DIR, `${Date.now()}_${id}_input.pdf`);
+    const outputPath = path.join(TMP_DIR, `${Date.now()}_${id}_output.pdf`);
+
+    const b64Raw =
+      req.body?.fileBase64 ?? req.body?.pdfBase64 ?? req.body?.base64 ?? null;
+
+    if (!b64Raw) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(400).json({
+        ok: false,
+        error: "Missing fileBase64 in JSON body.",
+      });
+    }
+
+    const b64 = stripDataUrlPrefix(b64Raw);
+
+    if (!looksLikeBase64(b64)) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(400).json({
+        ok: false,
+        error: "fileBase64 does not look like valid base64.",
+      });
+    }
+
+    // decode base64 -> PDF buffer
+    let pdfBuf = null;
+    try {
+      const cleaned = String(b64).replace(/\s/g, "");
+      pdfBuf = Buffer.from(cleaned, "base64");
+
+      if (pdfBuf.length > MAX_FILE_BYTES) {
+        throw new Error(`File too large. Max ${MAX_FILE_MB}MB.`);
+      }
+
+      // minimal guard: must start with %PDF
+      const head = pdfBuf.slice(0, 4).toString("utf-8");
+      if (head !== "%PDF") {
+        throw new Error("Decoded bytes do not look like a PDF (%PDF missing).");
+      }
+    } catch (e) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid base64 PDF.",
+        detail: String(e?.message || e),
+      });
+    }
+
+    try {
+      await fsp.writeFile(inputPath, pdfBuf);
+    } catch (e) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(500).json({
+        ok: false,
+        error: "Failed to write temp PDF file.",
+        detail: String(e?.message || e),
+      });
+    }
+
+    // options handling (prioritas sama)
+    const textRaw = req.body?.text;
+    const dxCm = safeNumber(req.body?.dxCm, 0);
+    const dyCm = safeNumber(req.body?.dyCm, 0);
+
+    let options = null;
+    try {
+      if (req.body?.options && typeof req.body.options === "string") {
+        options = JSON.parse(req.body.options);
+      } else if (req.body?.options && typeof req.body.options === "object") {
+        options = req.body.options;
+      } else {
+        options = buildDefaultOptionsFromText({ textRaw, dxCm, dyCm });
+      }
+
+      if (!options || typeof options !== "object" || Array.isArray(options)) {
+        throw new Error("Options must be a JSON object");
+      }
+    } catch (e) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid JSON in 'options' (or invalid options object).",
+        detail: String(e?.message || e),
+      });
+    }
+
+    options = normalizeOptions(options);
+
+    if (options.texts.length === 0 && options.addWidthCm === 0) {
+      await safeUnlink(inputPath);
+      await safeUnlink(outputPath);
+      return res.status(400).json({
+        ok: false,
+        error: "Nothing to do: no resize and no text to stamp",
+      });
+    }
+
+    const result = await runPython({ inputPath, outputPath, options });
+
+    await safeUnlink(inputPath);
+
+    if (!result.ok) {
+      await safeUnlink(outputPath);
+      return res.status(500).json({
+        ok: false,
+        error:
+          result.code === -1
+            ? "Failed to start Python process."
+            : "PDF processing failed.",
+        exitCode: result.code,
+        stderr: (result.stderr || "").trim() || null,
+        stdout: (result.stdout || "").trim() || null,
+        detail: result.error || null,
+        usedOptions: options,
+      });
+    }
+
+    try {
+      return await returnOutput({ req, res, outputPath });
+    } catch (e) {
+      await safeUnlink(outputPath);
+      return res.status(500).json({
+        ok: false,
+        error: "Could not return output PDF.",
+        detail: String(e?.message || e),
+      });
+    }
+  }
+
+  // bukan JSON → lanjut ke handler multer (multipart)
+  return next();
+});
+
+// ---- Router 2: handler LAMA (multipart) tetap seperti sebelumnya ----
 app.post(
   "/resize-stamp",
   upload.fields([
@@ -372,7 +511,12 @@ app.post(
     const outputPath = path.join(TMP_DIR, `${Date.now()}_${id}_output.pdf`);
 
     // NOTE: text/dxCm/dyCm datang dari req.body (bukan file)
+    // text bisa string atau array jika field "text" dikirim berulang kali
     const textRaw = req.body?.text;
+    const textList = Array.isArray(textRaw)
+      ? textRaw.map((t) => String(t || "").trim()).filter(Boolean)
+      : [String(textRaw || "").trim()].filter(Boolean);
+
     const dxCm = safeNumber(req.body?.dxCm, 0);
     const dyCm = safeNumber(req.body?.dyCm, 0);
 
@@ -390,7 +534,38 @@ app.post(
       }
       // C) default mode: hanya "text"
       else {
-        options = buildDefaultOptionsFromText({ textRaw, dxCm, dyCm });
+        options = {
+          addWidthCm: DEFAULT_ADD_WIDTH_CM,
+          side: DEFAULT_SIDE,
+          applyTo: DEFAULT_APPLY_TO,
+          texts: textList.length
+            ? textList.length > 1
+              ? textList.map((t, idx) => ({
+                  value: t,
+                  align: DEFAULT_ALIGN, // ✅ DEFAULT RIGHT ALIGN
+                  charSpace: DEFAULT_CHAR_SPACE,
+                  position: "right_top",
+                  marginTopCm: 5,
+                  dxCm: dxCm,
+                  dyCm: dyCm,
+                  fontSize: DEFAULT_FONT_SIZE,
+                  font: DEFAULT_FONT,
+                  page: idx + 1, // 1-based page number
+                }))
+              : [
+                  {
+                    value: textList[0],
+                    position: "right_top",
+                    marginTopCm: 5,
+                    dxCm: dxCm,
+                    dyCm: dyCm,
+                    fontSize: DEFAULT_FONT_SIZE,
+                    font: DEFAULT_FONT,
+                    page: "all", // tetap seperti sebelumnya
+                  },
+                ]
+            : [],
+        };
       }
 
       if (!options || typeof options !== "object" || Array.isArray(options)) {
@@ -418,19 +593,13 @@ app.post(
 
     // Guard: nothing to do
     if (options.texts.length === 0 && options.addWidthCm === 0) {
-      await safeUnlink(inputPath);
-      await safeUnlink(outputPath);
       return res.status(400).json({
         ok: false,
         error: "Nothing to do: no resize and no text to stamp",
       });
     }
 
-    console.log("Normalized options:", options);
-    console.log("req.body:", req.body);
-    console.log("options before normalize:", options);
-
-    const result = await runPythonResizeStamp({ inputPath, outputPath, options });
+    const result = await runPython({ inputPath, outputPath, options });
 
     await safeUnlink(inputPath);
 
@@ -462,168 +631,6 @@ app.post(
     }
   },
 );
-
-/**
- * NEW: POST /resize-stamp-base64
- *
- * Content-Type: application/json
- * Body:
- *   {
- *     "fileBase64": "<base64 pdf>"   // required (boleh juga data URL: data:application/pdf;base64,...)
- *     "options": {...}              // optional (object) OR string JSON
- *     "text": "..."                 // optional (dipakai kalau options tidak ada)
- *     "dxCm": 0, "dyCm": 0          // optional
- *   }
- *
- * Query:
- *   ?out=pdf | base64 | both   (sama seperti endpoint lama)
- */
-app.post("/resize-stamp-base64", async (req, res) => {
-  const id = randomId();
-  const inputPath = path.join(TMP_DIR, `${Date.now()}_${id}_input.pdf`);
-  const outputPath = path.join(TMP_DIR, `${Date.now()}_${id}_output.pdf`);
-
-  // terima beberapa nama field yang umum dipakai
-  const b64Raw =
-    req.body?.fileBase64 ?? req.body?.pdfBase64 ?? req.body?.base64 ?? null;
-
-  if (!b64Raw) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing fileBase64 in JSON body.",
-      hint: 'Send {"fileBase64":"..."} (base64 PDF)',
-    });
-  }
-
-  const b64 = stripDataUrlPrefix(b64Raw);
-
-  if (!looksLikeBase64(b64)) {
-    return res.status(400).json({
-      ok: false,
-      error: "fileBase64 does not look like valid base64.",
-    });
-  }
-
-  // Decode base64 -> buffer
-  let pdfBuf = null;
-  try {
-    // jika base64 mengandung whitespace/newline, aman
-    const cleaned = String(b64).replace(/\s/g, "");
-    pdfBuf = Buffer.from(cleaned, "base64");
-
-    // Validasi minimal: PDF biasanya diawali "%PDF"
-    const head = pdfBuf.slice(0, 4).toString("utf-8");
-    if (head !== "%PDF") {
-      // masih mungkin PDF terenkripsi/aneh, tapi ini guard sederhana
-      // kalau kamu mau longgar, boleh hapus blok ini.
-      throw new Error("Decoded bytes do not look like a PDF (%PDF missing).");
-    }
-
-    if (pdfBuf.length > MAX_FILE_BYTES) {
-      throw new Error(`File too large. Max ${MAX_FILE_MB}MB.`);
-    }
-  } catch (e) {
-    await safeUnlink(inputPath);
-    await safeUnlink(outputPath);
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid base64 PDF.",
-      detail: String(e?.message || e),
-    });
-  }
-
-  // Simpan buffer jadi file sementara
-  try {
-    await fsp.writeFile(inputPath, pdfBuf);
-  } catch (e) {
-    await safeUnlink(inputPath);
-    await safeUnlink(outputPath);
-    return res.status(500).json({
-      ok: false,
-      error: "Failed to write temp PDF file.",
-      detail: String(e?.message || e),
-    });
-  }
-
-  // Options handling (sama prioritas seperti endpoint lama)
-  const textRaw = req.body?.text;
-  const dxCm = safeNumber(req.body?.dxCm, 0);
-  const dyCm = safeNumber(req.body?.dyCm, 0);
-
-  let options = null;
-
-  try {
-    // A) options sebagai string JSON
-    if (req.body?.options && typeof req.body.options === "string") {
-      options = JSON.parse(req.body.options);
-    }
-    // B) options sebagai object JSON
-    else if (req.body?.options && typeof req.body.options === "object") {
-      options = req.body.options;
-    }
-    // C) default mode: hanya "text"
-    else {
-      options = buildDefaultOptionsFromText({ textRaw, dxCm, dyCm });
-    }
-
-    if (!options || typeof options !== "object" || Array.isArray(options)) {
-      throw new Error("Options must be a JSON object");
-    }
-  } catch (e) {
-    await safeUnlink(inputPath);
-    await safeUnlink(outputPath);
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid JSON in 'options' (or invalid options object).",
-      detail: String(e?.message || e),
-    });
-  }
-
-  options = normalizeOptions(options);
-
-  // Guard: nothing to do
-  if (options.texts.length === 0 && options.addWidthCm === 0) {
-    await safeUnlink(inputPath);
-    await safeUnlink(outputPath);
-    return res.status(400).json({
-      ok: false,
-      error: "Nothing to do: no resize and no text to stamp",
-    });
-  }
-
-  console.log("[base64] Normalized options:", options);
-
-  const result = await runPythonResizeStamp({ inputPath, outputPath, options });
-
-  await safeUnlink(inputPath);
-
-  if (!result.ok) {
-    await safeUnlink(outputPath);
-    return res.status(500).json({
-      ok: false,
-      error:
-        result.code === -1
-          ? "Failed to start Python process."
-          : "PDF processing failed.",
-      exitCode: result.code,
-      stderr: (result.stderr || "").trim() || null,
-      stdout: (result.stdout || "").trim() || null,
-      detail: result.error || null,
-      usedOptions: options,
-    });
-  }
-
-  try {
-    return await returnOutput({ req, res, outputPath });
-  } catch (e) {
-    await safeUnlink(outputPath);
-    return res.status(500).json({
-      ok: false,
-      error: "Could not return output PDF.",
-      detail: String(e?.message || e),
-    });
-  }
-});
 
 // ---------- Error handler ----------
 app.use((err, req, res, next) => {
