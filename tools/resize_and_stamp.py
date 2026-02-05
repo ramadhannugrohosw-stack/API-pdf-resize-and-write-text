@@ -4,9 +4,6 @@
 # Resize PDF page canvas (MediaBox/CropBox) without scaling content,
 # then stamp custom text at desired coordinates.
 #
-# Called by server.js:
-#   python tools/resize_and_stamp.py --input in.pdf --output out.pdf --options '{"..."}'
-#
 # Dependencies:
 #   pikepdf, reportlab
 
@@ -58,13 +55,6 @@ def normalize_apply_to(apply_to: str) -> str:
 
 
 def parse_page_selector(page_value: Any, page_count: int) -> List[int]:
-    """
-    Returns list of 0-based page indices to apply.
-    page_value can be:
-      - "all"
-      - int (1-based)
-      - list of ints (1-based)
-    """
     if page_value is None or (
         isinstance(page_value, str) and page_value.strip().lower() == "all"
     ):
@@ -72,15 +62,12 @@ def parse_page_selector(page_value: Any, page_count: int) -> List[int]:
 
     if isinstance(page_value, (int, float)) and not isinstance(page_value, bool):
         idx = int(page_value) - 1
-        if 0 <= idx < page_count:
-            return [idx]
-        return []
+        return [idx] if 0 <= idx < page_count else []
 
     if isinstance(page_value, str):
         try:
             idx = int(page_value.strip()) - 1
-            if 0 <= idx < page_count:
-                return [idx]
+            return [idx] if 0 <= idx < page_count else []
         except Exception:
             return []
 
@@ -98,13 +85,7 @@ def parse_page_selector(page_value: Any, page_count: int) -> List[int]:
     return []
 
 
-def get_box(
-    page: pikepdf.Page, box_name: str
-) -> Optional[Tuple[float, float, float, float]]:
-    """
-    box_name: "MediaBox" / "CropBox"
-    Returns (x0, y0, x1, y1) in pts, or None if absent.
-    """
+def get_box(page: pikepdf.Page, box_name: str) -> Optional[Tuple[float, float, float, float]]:
     key = Name(f"/{box_name}")
     if key not in page.obj:
         return None
@@ -138,14 +119,11 @@ def resize_box(
 
 
 def ensure_cropbox_consistent(page: pikepdf.Page, new_media: Tuple[float, float, float, float]) -> None:
-    """
-    If CropBox missing, set to MediaBox so viewers show expanded canvas.
-    """
     if get_box(page, "CropBox") is None:
         set_box(page, "CropBox", new_media)
 
 
-def clamp_font_size(v: Any, default: float = 8.5) -> float:
+def clamp_font_size(v: Any, default: float = 8) -> float:
     fs = safe_float(v, default)
     if fs <= 0:
         return default
@@ -161,9 +139,6 @@ def normalize_font_name(v: Any) -> str:
 
 
 def normalize_align(v: Any) -> str:
-    """
-    left | center | right
-    """
     s = str(v) if v is not None else "right"
     s = s.strip().lower()
     if s in ("right", "r"):
@@ -174,7 +149,6 @@ def normalize_align(v: Any) -> str:
 
 
 def get_char_space(item: Dict[str, Any]) -> float:
-    # Backward/compat: accept both keys.
     if "charSpace" in item:
         return safe_float(item.get("charSpace"), 0.52)
     if "char_space" in item:
@@ -182,36 +156,53 @@ def get_char_space(item: Dict[str, Any]) -> float:
     return 0.52
 
 
+def add_overlay_no_scale(
+    target_page: pikepdf.Page,
+    overlay_page: pikepdf.Page,
+    media_x0: float,
+    media_y0: float,
+    media_x1: float,
+    media_y1: float,
+) -> None:
+    """
+    Best-effort to avoid any scaling:
+    - Prefer add_overlay(..., rect=Rectangle(...)) when supported.
+    - Fallback to add_overlay(overlay_page) if old pikepdf.
+    """
+    rect = pikepdf.Rectangle(media_x0, media_y0, media_x1, media_y1)
+    try:
+        # Newer pikepdf supports rect=
+        target_page.add_overlay(overlay_page, rect=rect)
+    except TypeError:
+        # Older pikepdf: no rect param → fallback (might scale on some PDFs)
+        target_page.add_overlay(overlay_page)
+
+
 def build_overlay_pdf_for_page(
-    page_width_pt: float,
-    page_height_pt: float,
+    # overlay size in pts, must be (media_w, media_h)
+    media_w: float,
+    media_h: float,
     text_items: List[Dict[str, Any]],
     # current MediaBox absolute:
-    mb_x0: float,
-    mb_y0: float,
-    mb_x1: float,
-    mb_y1: float,
-    # old/original MediaBox absolute (for "right edge of original page"):
-    old_mb_x0: float,
-    old_mb_y0: float,
-    old_mb_x1: float,
-    old_mb_y1: float,
+    media_x0: float,
+    media_y0: float,
+    media_x1: float,
+    media_y1: float,
+    # original reference top for Y (paper original):
+    old_ref_y1: float,
 ) -> bytes:
     """
-    Create a single-page overlay PDF (same size as resized page)
-    containing all text items for that page.
-
-    Key fix for "any paper size":
-    - Compute target coordinates in absolute PDF user space using MediaBox.
-    - Convert to overlay-local coords by subtracting mb_x0/mb_y0.
-    - Default anchor remains "right_top" with marginTop 5cm from top.
+    Overlay dibuat dalam koordinat LOCAL (0..media_w, 0..media_h).
+    Jadi semua koordinat harus kita convert:
+      x_local = x_abs - media_x0
+      y_local = y_abs - media_y0
     """
 
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
         overlay_path = tf.name
 
     try:
-        c = rl_canvas.Canvas(overlay_path, pagesize=(page_width_pt, page_height_pt))
+        c = rl_canvas.Canvas(overlay_path, pagesize=(media_w, media_h))
         c.setFillColor(black)
 
         for item in text_items:
@@ -229,36 +220,30 @@ def build_overlay_pdf_for_page(
             dx_cm = safe_float(item.get("dxCm"), 0.0)
             dy_cm = safe_float(item.get("dyCm"), 0.0)
 
-            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)   # default 5 cm from top
+            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)
             margin_right_cm = safe_float(item.get("marginRightCm"), 1.0)
 
-            # ---- Absolute target coordinate in PDF user space ----
-            # Explicit coords (keep compatibility):
+            # absolute coordinate in PDF user space
             if item.get("xPt") is not None or item.get("yPt") is not None:
-                x_abs = mb_x0 + safe_float(item.get("xPt"), 0.0)
-                y_abs = mb_y0 + safe_float(item.get("yPt"), 0.0)
+                x_abs = media_x0 + safe_float(item.get("xPt"), 0.0)
+                y_abs = media_y0 + safe_float(item.get("yPt"), 0.0)
             elif item.get("xCm") is not None or item.get("yCm") is not None:
-                x_abs = mb_x0 + cm_to_pt(safe_float(item.get("xCm"), 0.0))
-                y_abs = mb_y0 + cm_to_pt(safe_float(item.get("yCm"), 0.0))
+                x_abs = media_x0 + cm_to_pt(safe_float(item.get("xCm"), 0.0))
+                y_abs = media_y0 + cm_to_pt(safe_float(item.get("yCm"), 0.0))
             else:
-                # Default anchor:
-                # y = top(current MediaBox) - marginTop + dy
-                y_abs = mb_y1 - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
+                # FORCE Y from original paper top:
+                y_abs = old_ref_y1 - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
 
-                # Default is right-top:
-                # x is near right edge of ORIGINAL page (old MediaBox), not including added blank area
-                # So numeric column anchor doesn't shift when resizing canvas.
+                # X sticks to CURRENT right edge (after resize):
                 if position in ("left_top", "top_left"):
-                    x_abs = mb_x0 + cm_to_pt(dx_cm)
+                    x_abs = media_x0 + cm_to_pt(dx_cm)
                 else:
-                    # treat empty/unknown position as right_top
-                    x_abs = old_mb_x1 - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
+                    x_abs = media_x1 - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
 
-            # Convert absolute -> overlay-local (0,0 at mb_x0/mb_y0)
-            x = x_abs - mb_x0
-            y = y_abs - mb_y0
+            # convert to overlay local (origin 0,0)
+            x = x_abs - media_x0
+            y = y_abs - media_y0
 
-            # Multi-line
             lines = value.split("\n")
             leading = safe_float(item.get("leading"), font_size * 1.0)
 
@@ -273,7 +258,6 @@ def build_overlay_pdf_for_page(
                 t.setCharSpace(char_space)
 
                 if align == "right":
-                    # x is right boundary
                     t.setTextOrigin(x - total_w, cur_y)
                 elif align == "center":
                     t.setTextOrigin(x - (total_w / 2.0), cur_y)
@@ -282,7 +266,6 @@ def build_overlay_pdf_for_page(
 
                 t.textLine(line)
                 c.drawText(t)
-
                 cur_y -= leading
 
         c.showPage()
@@ -329,16 +312,22 @@ def main() -> int:
         with pikepdf.open(in_path) as pdf:
             page_count = len(pdf.pages)
 
-            # Capture old MediaBox per page (absolute coords)
+            # old MediaBox and old reference top (prefer old CropBox)
             old_media_boxes: List[Tuple[float, float, float, float]] = []
+            old_ref_tops: List[float] = []
+
             for p in pdf.pages:
                 mb = get_box(p, "MediaBox")
                 if mb is None:
-                    mb = (0.0, 0.0, 612.0, 792.0)  # fallback letter
+                    mb = (0.0, 0.0, 612.0, 792.0)
                     set_box(p, "MediaBox", mb)
                 old_media_boxes.append(mb)
 
-            # 1) Resize page boxes
+                cb = get_box(p, "CropBox")
+                ref = cb if cb is not None else mb
+                old_ref_tops.append(ref[3])  # old top y1
+
+            # 1) resize boxes
             for i, page in enumerate(pdf.pages):
                 old_mb = old_media_boxes[i]
                 new_mb = resize_box(old_mb, add_width_pt, side)
@@ -356,18 +345,13 @@ def main() -> int:
                 cur_mb = get_box(page, "MediaBox") or new_mb
                 ensure_cropbox_consistent(page, cur_mb)
 
-            # 2) Stamp overlays
+            # 2) stamp
             if texts:
-                items_by_page: Dict[int, List[Dict[str, Any]]] = {
-                    i: [] for i in range(page_count)
-                }
-
+                items_by_page: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(page_count)}
                 for item in texts:
                     if not isinstance(item, dict):
                         continue
                     target_pages = parse_page_selector(item.get("page", "all"), page_count)
-                    if not target_pages:
-                        continue
                     for pi in target_pages:
                         items_by_page[pi].append(item)
 
@@ -376,35 +360,37 @@ def main() -> int:
                     if not page_items:
                         continue
 
-                    mb = get_box(page, "MediaBox")
-                    if mb is None:
+                    media = get_box(page, "MediaBox")
+                    if media is None:
                         continue
-                    mb_x0, mb_y0, mb_x1, mb_y1 = mb
-                    page_w = mb_x1 - mb_x0
-                    page_h = mb_y1 - mb_y0
-
-                    old_mb = old_media_boxes[i]
-                    old_x0, old_y0, old_x1, old_y1 = old_mb
+                    media_x0, media_y0, media_x1, media_y1 = media
+                    media_w = media_x1 - media_x0
+                    media_h = media_y1 - media_y0
 
                     overlay_bytes = build_overlay_pdf_for_page(
-                        page_width_pt=page_w,
-                        page_height_pt=page_h,
+                        media_w=media_w,
+                        media_h=media_h,
                         text_items=page_items,
-                        mb_x0=mb_x0,
-                        mb_y0=mb_y0,
-                        mb_x1=mb_x1,
-                        mb_y1=mb_y1,
-                        old_mb_x0=old_x0,
-                        old_mb_y0=old_y0,
-                        old_mb_x1=old_x1,
-                        old_mb_y1=old_y1,
+                        media_x0=media_x0,
+                        media_y0=media_y0,
+                        media_x1=media_x1,
+                        media_y1=media_y1,
+                        old_ref_y1=old_ref_tops[i],
                     )
 
                     overlay_pdf = pikepdf.Pdf.open(io.BytesIO(overlay_bytes))
                     overlay_page = overlay_pdf.pages[0]
 
-                    # Keep compatibility with pikepdf version:
-                    page.add_overlay(overlay_page)
+                    # IMPORTANT: overlay must be 0-based (0..w,h), not absolute coords
+                    set_box(overlay_page, "MediaBox", (0.0, 0.0, media_w, media_h))
+                    set_box(overlay_page, "CropBox", (0.0, 0.0, media_w, media_h))
+
+                    # Copy rotation (safe if 0)
+                    rot = int(page.obj.get(Name("/Rotate"), 0) or 0)
+                    overlay_page.obj[Name("/Rotate")] = rot
+
+                    # Add overlay without scaling (rect if supported)
+                    add_overlay_no_scale(page, overlay_page, media_x0, media_y0, media_x1, media_y1)
 
             pdf.save(out_path)
         return 0
