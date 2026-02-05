@@ -39,7 +39,7 @@ const DEFAULT_Y_CM = Number(process.env.DEFAULT_Y_CM || 14);
 const DEFAULT_FONT_SIZE = Number(process.env.DEFAULT_FONT_SIZE || 8.5);
 const DEFAULT_FONT = process.env.DEFAULT_FONT || "Helvetica";
 const DEFAULT_ALIGN = (process.env.DEFAULT_ALIGN || "right").toLowerCase();
-const DEFAULT_CHAR_SPACE = process.env.DEFAULT_CHAR_SPACE || 0.5;
+const DEFAULT_CHAR_SPACE = Number(process.env.DEFAULT_CHAR_SPACE || 0.5);
 
 // Ensure tmp dir exists
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -215,7 +215,7 @@ app.post(
               ? textList.map((t, idx) => ({
                   value: t,
                   align: DEFAULT_ALIGN, // ✅ DEFAULT RIGHT ALIGN
-                  char_space: DEFAULT_CHAR_SPACE,
+                  charSpace: DEFAULT_CHAR_SPACE,
                   position: "right_top",
                   marginTopCm: 5,
                   dxCm: dxCm,
@@ -263,18 +263,18 @@ app.post(
 
     // Normalize / safety defaults
     // Backward compatibility: simple text
-    if (req.body.text && !req.body.options) {
-      options = {
-        texts: [
-          {
-            value: String(req.body.text),
-            page: "all",
-            dxCm: 0,
-            dyCm: 0,
-          },
-        ],
-      };
-    }
+    // if (req.body.text && !req.body.options) {
+    //   options = {
+    //     texts: [
+    //       {
+    //         value: String(req.body.text),
+    //         page: "all",
+    //         dxCm: 0,
+    //         dyCm: 0,
+    //       },
+    //     ],
+    //   };
+    // }
 
     options = {
       addWidthCm: Number(options.addWidthCm ?? DEFAULT_ADD_WIDTH_CM),
@@ -328,7 +328,8 @@ app.post(
     });
 
     child.on("close", async (code) => {
-      // input PDF sudah tidak diperlukan
+      const outMode = String(req.query?.out || "both").toLowerCase(); // pdf | base64 | both
+
       await safeUnlink(inputPath);
 
       if (code !== 0) {
@@ -339,15 +340,62 @@ app.post(
           exitCode: code,
           stderr: stderr.trim() || null,
           stdout: stdout.trim() || null,
-          // helpful debug
           usedOptions: options,
         });
       }
 
-      // Stream output PDF
       try {
         const stat = await fsp.stat(outputPath);
 
+        if (outMode === "both") {
+          const buf = await fsp.readFile(outputPath);
+          const b64 = buf.toString("base64");
+          await safeUnlink(outputPath);
+
+          const boundary = "pdfBoundary_" + randomId();
+          res.status(200);
+          res.setHeader(
+            "Content-Type",
+            `multipart/mixed; boundary=${boundary}`,
+          );
+
+          res.write(`--${boundary}\r\n`);
+          res.write(`Content-Type: application/pdf\r\n`);
+          res.write(
+            `Content-Disposition: attachment; filename="resized_stamped_${Date.now()}.pdf"\r\n`,
+          );
+          res.write(`Content-Length: ${buf.length}\r\n\r\n`);
+          res.write(buf);
+          res.write(`\r\n`);
+
+          const json = JSON.stringify({
+            ok: true,
+            mime: "application/pdf",
+            size: buf.length,
+            outputBase64: b64,
+          });
+
+          res.write(`--${boundary}\r\n`);
+          res.write(`Content-Type: application/json\r\n\r\n`);
+          res.write(json);
+          res.write(`\r\n--${boundary}--\r\n`);
+          return res.end();
+        }
+
+        if (outMode === "base64") {
+          const buf = await fsp.readFile(outputPath);
+          const b64 = buf.toString("base64");
+          await safeUnlink(outputPath);
+
+          return res.json({
+            ok: true,
+            mime: "application/pdf",
+            size: stat.size,
+            outputBase64: b64,
+          });
+        }
+
+        // default pdf stream
         res.setHeader("Content-Type", "application/pdf");
         res.setHeader("Content-Length", String(stat.size));
         res.setHeader(

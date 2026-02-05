@@ -173,18 +173,40 @@ def normalize_align(v: Any) -> str:
     return "left"
 
 
+def get_char_space(item: Dict[str, Any]) -> float:
+    # Backward/compat: accept both keys.
+    if "charSpace" in item:
+        return safe_float(item.get("charSpace"), 0.52)
+    if "char_space" in item:
+        return safe_float(item.get("char_space"), 0.52)
+    return 0.52
+
+
 def build_overlay_pdf_for_page(
     page_width_pt: float,
     page_height_pt: float,
     text_items: List[Dict[str, Any]],
-    old_width_pt: float,
-    side: str,
+    # current MediaBox absolute:
+    mb_x0: float,
+    mb_y0: float,
+    mb_x1: float,
+    mb_y1: float,
+    # old/original MediaBox absolute (for "right edge of original page"):
+    old_mb_x0: float,
+    old_mb_y0: float,
+    old_mb_x1: float,
+    old_mb_y1: float,
 ) -> bytes:
     """
     Create a single-page overlay PDF (same size as resized page)
     containing all text items for that page.
-    Return PDF bytes.
+
+    Key fix for "any paper size":
+    - Compute target coordinates in absolute PDF user space using MediaBox.
+    - Convert to overlay-local coords by subtracting mb_x0/mb_y0.
+    - Default anchor remains "right_top" with marginTop 5cm from top.
     """
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
         overlay_path = tf.name
 
@@ -197,77 +219,55 @@ def build_overlay_pdf_for_page(
             if not value:
                 continue
 
-            # NOTE: anchor currently forced to "page" below (kept for compatibility)
-            anchor = str(item.get("anchor", "blank_right")).strip().lower()
-
             font_name = normalize_font_name(item.get("font", "Helvetica"))
-            font_size = clamp_font_size(item.get("fontSize", 8.5))
-
-            # ✅ charSpace only works with TextObject (beginText)
-            # Use pt units. Default 0.0 keeps current behavior.
-            char_space = safe_float(item.get("charSpace"), 0.52)
-
+            font_size = clamp_font_size(item.get("fontSize", 8))
             align = normalize_align(item.get("align", "right"))
+            char_space = get_char_space(item)
 
-            # Coordinates: prefer pt if provided, else cm
             position = str(item.get("position", "")).strip().lower()
 
-            # dx/dy (offset) in cm
             dx_cm = safe_float(item.get("dxCm"), 0.0)
             dy_cm = safe_float(item.get("dyCm"), 0.0)
 
-            # default margins
-            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)    # 5 cm dari atas
+            margin_top_cm = safe_float(item.get("marginTopCm"), 5.0)   # default 5 cm from top
             margin_right_cm = safe_float(item.get("marginRightCm"), 1.0)
 
-            # If explicit coords provided, keep compatibility
+            # ---- Absolute target coordinate in PDF user space ----
+            # Explicit coords (keep compatibility):
             if item.get("xPt") is not None or item.get("yPt") is not None:
-                x = safe_float(item.get("xPt"), 0.0)
-                y = safe_float(item.get("yPt"), 0.0)
+                x_abs = mb_x0 + safe_float(item.get("xPt"), 0.0)
+                y_abs = mb_y0 + safe_float(item.get("yPt"), 0.0)
             elif item.get("xCm") is not None or item.get("yCm") is not None:
-                x = cm_to_pt(safe_float(item.get("xCm"), 0.0))
-                y = cm_to_pt(safe_float(item.get("yCm"), 0.0))
+                x_abs = mb_x0 + cm_to_pt(safe_float(item.get("xCm"), 0.0))
+                y_abs = mb_y0 + cm_to_pt(safe_float(item.get("yCm"), 0.0))
             else:
-                # Position-based mode (absolute + automatic)
+                # Default anchor:
+                # y = top(current MediaBox) - marginTop + dy
+                y_abs = mb_y1 - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
+
+                # Default is right-top:
+                # x is near right edge of ORIGINAL page (old MediaBox), not including added blank area
+                # So numeric column anchor doesn't shift when resizing canvas.
                 if position in ("left_top", "top_left"):
-                    anchor = "page"
-                    # fallback
-                    x = cm_to_pt(dx_cm)
-                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
-                    anchor = "page"
-                elif position in ("right_top", "top_right"):
-                    # y: 5 cm from top (+ dy offset)
-                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
-
-                    # x: near the right edge of the ORIGINAL page width (+ dx offset)
-                    # For right-aligned numeric columns: x is the right boundary.
-                    x = (old_width_pt) - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
-
+                    x_abs = mb_x0 + cm_to_pt(dx_cm)
                 else:
-                    # y: 5 cm from top (+ dy offset)
-                    y = page_height_pt - cm_to_pt(margin_top_cm) + cm_to_pt(dy_cm)
+                    # treat empty/unknown position as right_top
+                    x_abs = old_mb_x1 - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
 
-                    # x: near the right edge of the ORIGINAL page width (+ dx offset)
-                    # For right-aligned numeric columns: x is the right boundary.
-                    x = (old_width_pt) - cm_to_pt(margin_right_cm) + cm_to_pt(dx_cm)
+            # Convert absolute -> overlay-local (0,0 at mb_x0/mb_y0)
+            x = x_abs - mb_x0
+            y = y_abs - mb_y0
 
-
-            # - "page": coords from full page origin (0,0)
-            # - "blank_right": coords from the start of the new blank area (right side)
-            # Current behavior: forced to page origin for stability
-            anchor = "page"
-
+            # Multi-line
             lines = value.split("\n")
-            leading = safe_float(item.get("leading"), font_size * 1)
+            leading = safe_float(item.get("leading"), font_size * 1.0)
 
             cur_y = y
             for line in lines:
-                # --- compute width including char spacing ---
                 base_w = stringWidth(line, font_name, font_size)
                 extra_w = max(len(line) - 1, 0) * char_space
                 total_w = base_w + extra_w
 
-                # --- create text object to apply char spacing ---
                 t = c.beginText()
                 t.setFont(font_name, font_size)
                 t.setCharSpace(char_space)
@@ -302,7 +302,6 @@ def main() -> int:
     ap.add_argument("--input", required=True, help="Input PDF path")
     ap.add_argument("--output", required=True, help="Output PDF path")
     ap.add_argument("--options", required=True, help="Options JSON string")
-
     args = ap.parse_args()
 
     in_path = args.input
@@ -330,7 +329,7 @@ def main() -> int:
         with pikepdf.open(in_path) as pdf:
             page_count = len(pdf.pages)
 
-            # Capture old MediaBox per page for positioning logic
+            # Capture old MediaBox per page (absolute coords)
             old_media_boxes: List[Tuple[float, float, float, float]] = []
             for p in pdf.pages:
                 mb = get_box(p, "MediaBox")
@@ -357,7 +356,7 @@ def main() -> int:
                 cur_mb = get_box(page, "MediaBox") or new_mb
                 ensure_cropbox_consistent(page, cur_mb)
 
-            # 2) Stamp text overlays per page (if any)
+            # 2) Stamp overlays
             if texts:
                 items_by_page: Dict[int, List[Dict[str, Any]]] = {
                     i: [] for i in range(page_count)
@@ -380,33 +379,34 @@ def main() -> int:
                     mb = get_box(page, "MediaBox")
                     if mb is None:
                         continue
-
-                    x0, y0, x1, y1 = mb
-                    page_w = x1 - x0
-                    page_h = y1 - y0
+                    mb_x0, mb_y0, mb_x1, mb_y1 = mb
+                    page_w = mb_x1 - mb_x0
+                    page_h = mb_y1 - mb_y0
 
                     old_mb = old_media_boxes[i]
-                    old_w = old_mb[2] - old_mb[0]
+                    old_x0, old_y0, old_x1, old_y1 = old_mb
 
                     overlay_bytes = build_overlay_pdf_for_page(
                         page_width_pt=page_w,
                         page_height_pt=page_h,
                         text_items=page_items,
-                        old_width_pt=old_w,
-                        side=side,
+                        mb_x0=mb_x0,
+                        mb_y0=mb_y0,
+                        mb_x1=mb_x1,
+                        mb_y1=mb_y1,
+                        old_mb_x0=old_x0,
+                        old_mb_y0=old_y0,
+                        old_mb_x1=old_x1,
+                        old_mb_y1=old_y1,
                     )
 
                     overlay_pdf = pikepdf.Pdf.open(io.BytesIO(overlay_bytes))
                     overlay_page = overlay_pdf.pages[0]
 
-                    # IMPORTANT:
-                    # - No matrix=
-                    # - No add_transformation
-                    # This keeps compatibility with your pikepdf version.
+                    # Keep compatibility with pikepdf version:
                     page.add_overlay(overlay_page)
 
             pdf.save(out_path)
-
         return 0
 
     except Exception as e:
